@@ -5,19 +5,53 @@ namespace WolfeLabs.AnalogThrottle
 {
     public class DebugHelper
     {
-        public static readonly string LogFile = Path.Combine(Path.GetDirectoryName(System.Reflection.Assembly.GetAssembly(typeof(Plugin)).Location), "AnalogThrottle.log");
+        public static readonly string LogFile = GetLogFile();
 
 #if DEBUG
-        private static readonly StreamWriter LogWriter = new StreamWriter(DebugHelper.LogFile, true);
+        private static readonly StreamWriter LogWriter = CreateLogWriter();
 #endif
         public static void Log (object data)
         {
 #if DEBUG
-            string line = $"[{ System.DateTime.Now.ToString("u") }] { Newtonsoft.Json.JsonConvert.SerializeObject(data) }";
-            Console.WriteLine(line);
-            LogWriter.WriteLine(line);
-            LogWriter.Flush();
+            try {
+                string line = $"[{ System.DateTime.Now.ToString("u") }] { Newtonsoft.Json.JsonConvert.SerializeObject(data) }";
+                Console.WriteLine(line);
+
+                if (null != LogWriter) {
+                    LogWriter.WriteLine(line);
+                    LogWriter.Flush();
+                }
+            } catch {
+                // Debug logging should never prevent the game session from loading.
+            }
 #endif
         }
+
+        private static string GetLogFile ()
+        {
+            string assemblyPath = typeof(Plugin).Assembly.Location;
+            string logDirectory = string.IsNullOrEmpty(assemblyPath) ? null : Path.GetDirectoryName(assemblyPath);
+
+            if (string.IsNullOrEmpty(logDirectory)) {
+                logDirectory = AppDomain.CurrentDomain.BaseDirectory;
+            }
+
+            if (string.IsNullOrEmpty(logDirectory)) {
+                logDirectory = Path.GetTempPath();
+            }
+
+            return Path.Combine(logDirectory, "AnalogThrottle.log");
+        }
+
+#if DEBUG
+        private static StreamWriter CreateLogWriter ()
+        {
+            try {
+                return new StreamWriter(DebugHelper.LogFile, true);
+            } catch {
+                return null;
+            }
+        }
+#endif
     }
 }

@@ -4,8 +4,11 @@ using SharpDX.DirectInput;
 
 namespace WolfeLabs.AnalogThrottle
 {
-    public class Controller
+    public class Controller : IDisposable
     {
+        private const int DirectInputInputLost = unchecked((int)0x8007001E);
+        private const int DirectInputNotAcquired = unchecked((int)0x8007000C);
+
         /// <summary>
         /// The event handler when an analog axis is changed (sliders, etc)
         /// </summary>
@@ -49,8 +52,10 @@ namespace WolfeLabs.AnalogThrottle
         /// </summary>
         public Joystick Joystick { get; private set; }
 
-        // The range of this specific input, to be remapped into a ushort later
-        private InputRange inputRange;
+        /// <summary>
+        /// Whether the underlying DirectInput device is still usable.
+        /// </summary>
+        public bool IsConnected { get; private set; } = true;
 
         // List of all axis
         private readonly DeviceObjectInstance[] Axis;
@@ -84,7 +89,8 @@ namespace WolfeLabs.AnalogThrottle
 
                 // Sets the range limiter to fit an ushort later on
                 try {
-                    this.inputRange = this.Joystick.GetObjectPropertiesById(axis.ObjectId).Range;
+                    this.Joystick.GetObjectPropertiesById(axis.ObjectId).Range =
+                        new InputRange(ushort.MinValue, ushort.MaxValue);
                 } catch { }
             }
 
@@ -96,10 +102,23 @@ namespace WolfeLabs.AnalogThrottle
         /// <summary>
         /// Triggers a pooling event on the Controller
         /// </summary>
-        public void HandleInput ()
+        public bool HandleInput ()
         {
+            if (!this.IsConnected)
+                return false;
+
             // Gets the state of the Joystick
-            JoystickState currentState = this.Joystick.GetCurrentState();
+            JoystickState currentState;
+            try {
+                currentState = this.Joystick.GetCurrentState();
+            } catch (SharpDX.SharpDXException e) {
+                return this.HandleInputException(e);
+            } catch (ObjectDisposedException e) {
+                DebugHelper.Log($"Controller removed after dispose: { this.Device.InstanceName }");
+                DebugHelper.Log(e);
+                this.IsConnected = false;
+                return false;
+            }
 
             // Processes Analog X/Y/Z
             this.CompareAndEmitAnalog("X", this.AxisPreviousState.X, currentState.X);
@@ -128,11 +147,57 @@ namespace WolfeLabs.AnalogThrottle
 
             // Updates previous state so that only new changes trigger events
             this.AxisPreviousState = currentState;
+            return true;
+        }
+
+        public void Dispose ()
+        {
+            this.IsConnected = false;
+
+            if (null == this.Joystick)
+                return;
+
+            try {
+                this.Joystick.Unacquire();
+            } catch { }
+
+            try {
+                this.Joystick.Dispose();
+            } catch { }
+
+            this.Joystick = null;
+        }
+
+        private bool HandleInputException (SharpDX.SharpDXException e)
+        {
+            if (e.HResult == DirectInputInputLost || e.HResult == DirectInputNotAcquired) {
+                DebugHelper.Log($"Controller input lost, attempting reacquire: { this.Device.InstanceName }");
+                try {
+                    this.Joystick.Acquire();
+                    return true;
+                } catch (SharpDX.SharpDXException reacquireException) {
+                    DebugHelper.Log($"Controller reacquire failed, removing device: { this.Device.InstanceName }");
+                    DebugHelper.Log(reacquireException);
+                    this.IsConnected = false;
+                    return false;
+                }
+            }
+
+            DebugHelper.Log($"Controller input failed, removing device: { this.Device.InstanceName }");
+            DebugHelper.Log(e);
+            this.IsConnected = false;
+            return false;
         }
 
         private ushort NormalizeValue (int rawValue)
         {
-            return (ushort)(((double)rawValue / (double)this.inputRange.Maximum) * (double)ushort.MaxValue);
+            if (rawValue <= ushort.MinValue)
+                return ushort.MinValue;
+
+            if (rawValue >= ushort.MaxValue)
+                return ushort.MaxValue;
+
+            return (ushort)rawValue;
         }
 
         private bool CompareAndEmitAnalog (string axisName, int oldValue, int newValue)

@@ -13,10 +13,15 @@ namespace WolfeLabs.AnalogThrottle
     [MySessionComponentDescriptor(MyUpdateOrder.BeforeSimulation)]
     class AnalogThrottleSession : MySessionComponentBase
     {
+        private const int CONTROLLER_SCAN_INTERVAL_TICKS = 300;
+
         public static AnalogThrottleSession Instance;
 
         // This List stores all currently connected controllers
         private List<Controller> controllers = new List<Controller>();
+
+        // Shared DirectInput instance used by all controllers
+        private DirectInput directInput = null;
 
         // This List will store all commands that will be sent to our PBs
         private ControllerInputCollection queuedInputEvents = new ControllerInputCollection();
@@ -24,8 +29,8 @@ namespace WolfeLabs.AnalogThrottle
         // Our current Player
         private IMyPlayer currentPlayer = null;
 
-        // Our current Cockpit
-        private IMyCockpit currentControlUnit = null;
+        // Our current Ship Controller
+        private IMyShipController currentControlUnit = null;
 
         // Our current Grid
         private IMyCubeGrid currentGrid = null;
@@ -41,17 +46,10 @@ namespace WolfeLabs.AnalogThrottle
             DebugHelper.Log("Session.Init()");
 
             // Initializes DirectInput
-            DirectInput directInput = new DirectInput();
+            this.directInput = new DirectInput();
 
             // Fetches the available controllers and sets them up
-            List<DeviceInstance> availableDevices = directInput.GetDevices(DeviceClass.GameControl, DeviceEnumerationFlags.AttachedOnly) as List<DeviceInstance>;
-            foreach (DeviceInstance deviceInstance in availableDevices) {
-                // Adds the Controller to available/monitoring list
-                Controller controller = new Controller(directInput, deviceInstance);
-                controller.AnalogInput += this.HandleAnalogInput;
-                controller.DigitalInput += this.HandleDigitalInput;
-                this.controllers.Add(controller);
-            }
+            this.ScanForControllers();
         }
 
         public override void LoadData ()
@@ -61,8 +59,12 @@ namespace WolfeLabs.AnalogThrottle
 
         protected override void UnloadData ()
         {
-            // Cleanup events
-            this.Session.Player.Controller.ControlledEntityChanged -= this.UpdateCurrentControlUnit;
+            this.UnsubscribeCurrentPlayer();
+            this.ClearCurrentGrid();
+            this.currentControlUnit = null;
+            this.queuedInputEvents.Clear();
+            this.DisposeControllers();
+            this.DisposeDirectInput();
 
             AnalogThrottleSession.Instance = null;
         }
@@ -87,6 +89,10 @@ namespace WolfeLabs.AnalogThrottle
                 this.UpdateCurrentControlUnit(null, this.Session.Player.Controller.ControlledEntity);
             }
 
+            if (0 == this.currentTick % CONTROLLER_SCAN_INTERVAL_TICKS) {
+                this.ScanForControllers();
+            }
+
             // For multiplayer sessions, only processed each n-th input
             if (!this.Session.IsServer && 0 != this.currentTick % Plugin.THROTTLE_MULTIPLAYER) {
                 DebugHelper.Log($"Skipping tick for multiplayer: { this.currentTick % Plugin.THROTTLE_MULTIPLAYER } of { Plugin.THROTTLE_MULTIPLAYER }");
@@ -94,8 +100,13 @@ namespace WolfeLabs.AnalogThrottle
             }
 
             // Ticks the Controllers
-            foreach (Controller controller in this.controllers) {
-                controller.HandleInput();
+            for (int controllerIndex = this.controllers.Count - 1; controllerIndex >= 0; controllerIndex--) {
+                Controller controller = this.controllers[controllerIndex];
+
+                if (!controller.HandleInput()) {
+                    DebugHelper.Log($"Removing disconnected controller: { controller.Device.InstanceName }");
+                    this.RemoveController(controllerIndex);
+                }
             }
 
             // Sends list of queued events and clears queue
@@ -108,12 +119,14 @@ namespace WolfeLabs.AnalogThrottle
 
         private void UpdateCurrentControlUnit (IMyControllableEntity oldUnit, IMyControllableEntity newUnit)
         {
-            // Tries to convert the new Control Unit into a Cockpit, becomes null otherwise
-            this.currentControlUnit = newUnit as IMyCockpit;
+            this.ClearCurrentGrid();
+
+            // Tries to convert the new Control Unit into a Ship Controller, becomes null otherwise
+            this.currentControlUnit = newUnit as IMyShipController;
 
             DebugHelper.Log("Convert Check");
-            // If a Cockpit and a grid are detected, extract grid information
-            if (null != this.currentControlUnit && null != this.currentControlUnit.CubeGrid) {
+            // If a usable Ship Controller and a grid are detected, extract grid information
+            if (this.CanUseControlUnit(this.currentControlUnit) && null != this.currentControlUnit.CubeGrid) {
                 // Prepares grid and events
                 DebugHelper.Log("Grid");
                 this.currentGrid = this.currentControlUnit.CubeGrid;
@@ -125,28 +138,27 @@ namespace WolfeLabs.AnalogThrottle
                 DebugHelper.Log("UpdateBlocks");
                 this.UpdateCurrentGridBlocks(null);
 
-                DebugHelper.Log($"Cockpit found: { this.currentControlUnit.CustomName }");
+                DebugHelper.Log($"Ship controller found: { this.currentControlUnit.CustomName }");
                 DebugHelper.Log($"Grid found: { this.currentControlUnit.CubeGrid.CustomName }");
                 return;
             }
 
-            // Clear current grid if no grid available
-            if (null != this.currentGrid) {
-                this.currentGrid.OnBlockAdded -= this.UpdateCurrentGridBlocks;
-                this.currentGrid.OnBlockRemoved -= this.UpdateCurrentGridBlocks;
-                this.currentGrid = null;
+            if (null == this.currentControlUnit) {
+                DebugHelper.Log($"No ship controller found");
+            } else {
+                DebugHelper.Log($"Ship controller cannot control ship: { this.currentControlUnit.CustomName }");
             }
+        }
 
-            // Also clear all PBs
-            this.currentProgrammableBlocks.Clear();
-
-            DebugHelper.Log($"No cockpit found");
+        private bool CanUseControlUnit (IMyShipController controlUnit)
+        {
+            return null != controlUnit && controlUnit.CanControlShip;
         }
 
         private void UpdateCurrentGridBlocks (IMySlimBlock changedBlock)
         {
-            // Makes sure we have an active cockpit and grid
-            if (this.currentGrid == null || this.currentGrid == null)
+            // Makes sure we have an active ship controller and grid
+            if (this.currentControlUnit == null || this.currentGrid == null)
                 return;
 
             // Gets a list of all blocks on the grid
@@ -193,7 +205,101 @@ namespace WolfeLabs.AnalogThrottle
         private void HandleDigitalInput (object sender, Controller.DigitalEventArgs args)
         {
             Controller controller = sender as Controller;
-            this.queuedInputEvents.Add(new ControllerInput(controller.Device.InstanceName, args.Axis, args.Value ? ushort.MinValue : ushort.MaxValue));
+            this.queuedInputEvents.Add(new ControllerInput(controller.Device.InstanceName, args.Axis, args.Value ? ushort.MaxValue : ushort.MinValue));
+        }
+
+        private void ScanForControllers ()
+        {
+            if (null == this.directInput)
+                return;
+
+            IList<DeviceInstance> availableDevices;
+            try {
+                availableDevices = this.directInput.GetDevices(DeviceClass.GameControl, DeviceEnumerationFlags.AttachedOnly);
+            } catch (Exception e) {
+                DebugHelper.Log("Controller scan failed");
+                DebugHelper.Log(e);
+                return;
+            }
+
+            if (null == availableDevices)
+                return;
+
+            foreach (DeviceInstance deviceInstance in availableDevices) {
+                if (!this.IsControllerKnown(deviceInstance)) {
+                    this.AddController(deviceInstance);
+                }
+            }
+        }
+
+        private bool IsControllerKnown (DeviceInstance deviceInstance)
+        {
+            foreach (Controller controller in this.controllers) {
+                if (controller.Device.InstanceGuid == deviceInstance.InstanceGuid) {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private void AddController (DeviceInstance deviceInstance)
+        {
+            try {
+                Controller controller = new Controller(this.directInput, deviceInstance);
+                controller.AnalogInput += this.HandleAnalogInput;
+                controller.DigitalInput += this.HandleDigitalInput;
+                this.controllers.Add(controller);
+                DebugHelper.Log($"Monitoring controller: { deviceInstance.InstanceName }");
+            } catch (Exception e) {
+                DebugHelper.Log($"Controller setup failed: { deviceInstance.InstanceName }");
+                DebugHelper.Log(e);
+            }
+        }
+
+        private void RemoveController (int controllerIndex)
+        {
+            Controller controller = this.controllers[controllerIndex];
+            controller.AnalogInput -= this.HandleAnalogInput;
+            controller.DigitalInput -= this.HandleDigitalInput;
+            controller.Dispose();
+            this.controllers.RemoveAt(controllerIndex);
+        }
+
+        private void DisposeControllers ()
+        {
+            for (int controllerIndex = this.controllers.Count - 1; controllerIndex >= 0; controllerIndex--) {
+                this.RemoveController(controllerIndex);
+            }
+        }
+
+        private void UnsubscribeCurrentPlayer ()
+        {
+            if (null != this.currentPlayer && null != this.currentPlayer.Controller) {
+                this.currentPlayer.Controller.ControlledEntityChanged -= this.UpdateCurrentControlUnit;
+            }
+
+            this.currentPlayer = null;
+        }
+
+        private void ClearCurrentGrid ()
+        {
+            if (null != this.currentGrid) {
+                this.currentGrid.OnBlockAdded -= this.UpdateCurrentGridBlocks;
+                this.currentGrid.OnBlockRemoved -= this.UpdateCurrentGridBlocks;
+                this.currentGrid = null;
+            }
+
+            this.currentProgrammableBlocks.Clear();
+        }
+
+        private void DisposeDirectInput ()
+        {
+            if (null == this.directInput)
+                return;
+
+            this.directInput.Dispose();
+            this.directInput = null;
         }
     }
 }
